@@ -12,15 +12,17 @@ GUI preview to pick default margins from a chosen page, then parse QA:
 - Detect leading question number in stem -> use as 'question_number'
 - Strip circled index (①/②/…) from option 'text' (kept only in 'index')
 - NEW: All text normalization collapses any whitespace (incl. newlines) to single spaces.
+- NEW: Optional automatic subject detection from page headers (use --subject auto).
 
 Usage:
-  python qa_gui_margins.py --pdf "C:\\path\\file.pdf" --out "C:\\path\\qa.json" --subject 형법 --year 2025 --target default
+  python qa_gui_margins.py --pdf "C:\\path\\file.pdf" --out "C:\\path\\qa.json" --subject auto --year 2025 --target default
   # optional knobs:
   --dpi 180 --tol 1.5 --top-frac 0.04 --bottom-frac 0.96 --gutter-frac 0.005
+  --subject-map header_map.json
 """
 
 import os, re, json, argparse, tempfile
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import pdfplumber
 
@@ -43,6 +45,145 @@ QUESTION_NUM_RE = re.compile(
 
 # For noisy sources, make sure option text never keeps the circled index
 CIRCLED_STRIP_RE = re.compile(rf"^[{CIRCLED}]\s*")
+
+# ---------- Header detection (for subject auto-detection) ----------
+TARGET_SUBJECTS = [
+    "경찰학개론",
+    "헌법",
+    "형사법",
+    "경찰학",
+    "형법",
+    "형사소송법",
+    "경찰학개론",
+]
+TARGET_SUBJECTS_CASEFOLD = [s.casefold() for s in TARGET_SUBJECTS if s]
+
+HEADER_TOL = 1.0          # tolerance to consider a line horizontal
+HEADER_MIN_FRAC = 0.5     # keep horizontals >= 50% of page width
+HEADER_PAD_DOWN = 3.0     # include a tiny band *below* the rule so boundary glyphs aren't dropped
+HEADER_X_TOL, HEADER_Y_TOL = 2, 4
+HEADER_LINE_MERGE_TOL = 2.0
+
+
+def _is_horizontal(line, tol=HEADER_TOL):
+    return abs(line.get("y0", 0.0) - line.get("y1", 0.0)) <= tol
+
+
+def words_in_bbox_toporigin(words, crop_rect_toporigin):
+    """Filter words (already in top-origin coords) by intersection with a top-origin rect."""
+
+    cx0, ctop, cx1, cbottom = crop_rect_toporigin
+    keep = []
+    for w in words:
+        top = w.get("top")
+        bottom = w.get("bottom")
+        x0 = w.get("x0")
+        x1 = w.get("x1")
+        if None in (top, bottom, x0, x1):
+            continue
+        if not (bottom < ctop or top > cbottom or x1 < cx0 or x0 > cx1):
+            keep.append(w)
+    return keep
+
+
+def words_to_text_in_reading_order(words, line_tol=HEADER_LINE_MERGE_TOL):
+    """Sort words by line (top) then x0, and join them into lines."""
+
+    if not words:
+        return ""
+
+    words = sorted(words, key=lambda w: (round(w.get("top", 0.0), 1), w.get("x0", 0.0)))
+    lines = []
+    current = []
+    prev_top = None
+    for w in words:
+        top = w.get("top")
+        if top is None:
+            continue
+        if prev_top is None or abs(top - prev_top) <= line_tol:
+            current.append(w.get("text", ""))
+        else:
+            lines.append(" ".join(current))
+            current = [w.get("text", "")]
+        prev_top = top
+    if current:
+        lines.append(" ".join(current))
+    return "\n".join(s.strip() for s in lines if s.strip())
+
+
+def extract_header_text(page,
+                        tol=HEADER_TOL,
+                        min_frac=HEADER_MIN_FRAC,
+                        pad_down=HEADER_PAD_DOWN,
+                        x_tol=HEADER_X_TOL,
+                        y_tol=HEADER_Y_TOL,
+                        line_merge_tol=HEADER_LINE_MERGE_TOL):
+    """Return text located above the topmost long horizontal rule on the page."""
+
+    working_page = page.rotate(-page.rotation) if page.rotation else page
+    width, height = float(working_page.width), float(working_page.height)
+
+    candidates = [
+        (max(line.get("y0", 0.0), line.get("y1", 0.0)), line)
+        for line in (working_page.lines or [])
+        if _is_horizontal(line, tol=tol) and abs(line.get("x1", 0.0) - line.get("x0", 0.0)) >= min_frac * width
+    ]
+    if not candidates:
+        return ""
+
+    y_div, _ = max(candidates, key=lambda t: t[0])
+    y0_pdf = max(0.0, y_div - pad_down)
+    bbox_pdf = (0, y0_pdf, width, height)
+
+    words = working_page.extract_words(x_tolerance=x_tol, y_tolerance=y_tol, keep_blank_chars=False) or []
+    crop_toporigin = {
+        "x0": bbox_pdf[0],
+        "top": height - bbox_pdf[3],
+        "x1": bbox_pdf[2],
+        "bottom": height - bbox_pdf[1],
+    }
+
+    words_crop = words_in_bbox_toporigin(
+        words,
+        (crop_toporigin["x0"], crop_toporigin["top"], crop_toporigin["x1"], crop_toporigin["bottom"])
+    )
+
+    return words_to_text_in_reading_order(words_crop, line_tol=line_merge_tol)
+
+
+def detect_page_subject(page,
+                        subject_keywords: Optional[Dict[str, str]] = None,
+                        target_subjects: Optional[List[str]] = None):
+    """Detect a page subject using the header text and optional keyword mapping.
+
+    Returns (subject or None, raw_header_text).
+    """
+
+    header_text = norm_space(extract_header_text(page))
+    if not header_text:
+        return None, ""
+
+    lowered = header_text.casefold()
+    if subject_keywords:
+        for key, value in subject_keywords.items():
+            if not key:
+                continue
+            if key.casefold() in lowered:
+                return value, header_text
+
+    targets = target_subjects or TARGET_SUBJECTS
+    target_lower = (
+        [s.casefold() for s in targets if s]
+        if target_subjects is not None
+        else TARGET_SUBJECTS_CASEFOLD
+    )
+    for subj, subj_lower in zip(targets, target_lower):
+        if not subj:
+            continue
+        if subj_lower in lowered:
+            return subj, header_text
+
+    return header_text, header_text
 
 def norm_space(s: str) -> str:
     """
@@ -189,16 +330,24 @@ def extract_qa_from_chunk_text(text: str):
     return stem, options, dispute, detected_qnum
 
 def pdf_to_qa_margin_chunked(pdf_path: str,
-                             subject: str, year: int, target: str,
+                             subject: Optional[str], year: int, target: str,
                              start_num: int,
                              L_margin: Optional[float], R_margin: Optional[float],
                              tol: float,
                              top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005,
-                             y_tol=3.0) -> List[Dict[str, Any]]:
+                             y_tol=3.0,
+                             auto_subject: bool = False,
+                             subject_keywords: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
     out = []
     qnum = start_num
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
+            effective_subject = subject
+            if auto_subject or subject is None:
+                detected, _header_text = detect_page_subject(page, subject_keywords=subject_keywords)
+                if detected:
+                    effective_subject = detected
+
             Lbbox, Rbbox = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
             L_chunks = chunk_column_by_margin(page, Lbbox, L_margin, tol, y_tol=y_tol) if L_margin is not None else []
             R_chunks = chunk_column_by_margin(page, Rbbox, R_margin, tol, y_tol=y_tol) if R_margin is not None else []
@@ -212,7 +361,7 @@ def pdf_to_qa_margin_chunked(pdf_path: str,
                 qno = detected_qnum if detected_qnum is not None else qnum
 
                 out.append({
-                    "subject": subject,
+                    "subject": (effective_subject if effective_subject is not None else ""),
                     "year": year,
                     "target": target,
                     "content": {
@@ -232,18 +381,25 @@ def pdf_to_qa_margin_chunked(pdf_path: str,
 # ---------- GUI ----------
 class MarginPreviewApp(tk.Tk):
     def __init__(self, pdf_path: str, out_path: str,
-                 subject: str, year: int, target: str,
-                 dpi=180, tol=1.5, top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005):
+                 subject: Optional[str], year: int, target: str,
+                 dpi=180, tol=1.5, top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005,
+                 auto_subject: bool = False,
+                 subject_keywords: Optional[Dict[str, str]] = None):
         super().__init__()
         self.title("QA Margin Preview & Parser")
         self.geometry("1200x850")
         self.minsize(900, 700)
+
+        if isinstance(subject, str) and subject.strip().lower() == "auto":
+            subject = None
 
         self.pdf_path = pdf_path
         self.out_path = out_path
         self.subject = subject
         self.year = year
         self.target = target
+        self.auto_subject = auto_subject or (subject is None)
+        self.subject_keywords = subject_keywords or {}
 
         self.dpi = dpi
         self.tol = tk.DoubleVar(value=float(tol))
@@ -470,14 +626,16 @@ class MarginPreviewApp(tk.Tk):
         try:
             qa = pdf_to_qa_margin_chunked(
                 pdf_path=self.pdf_path,
-                subject=self.subject, year=self.year, target=self.target,
+                subject=(None if self.auto_subject else self.subject), year=self.year, target=self.target,
                 start_num=1,
                 L_margin=self.L_margin, R_margin=self.R_margin,
                 tol=float(self.tol.get()),
                 top_frac=float(self.top_frac.get()),
                 bottom_frac=float(self.bottom_frac.get()),
                 gutter_frac=float(self.gutter_frac.get()),
-                y_tol=3.0
+                y_tol=3.0,
+                auto_subject=self.auto_subject,
+                subject_keywords=self.subject_keywords
             )
         except Exception as e:
             messagebox.showerror("Parse failed", str(e))
@@ -509,7 +667,7 @@ def main():
     ap = argparse.ArgumentParser(description="Preview margins, assign defaults, and parse QA from PDF.")
     ap.add_argument("--pdf", required=True, help="Path to PDF")
     ap.add_argument("--out", required=True, help="Path to write QA JSON (file path; if folder, dialog will prompt)")
-    ap.add_argument("--subject", required=True, help="Subject (e.g., 형법)")
+    ap.add_argument("--subject", help="Subject (e.g., 형법). Use 'auto' to detect from page headers.")
     ap.add_argument("--year", type=int, required=True, help="Year (e.g., 2025)")
     ap.add_argument("--target", default="default", help="Target label")
 
@@ -518,20 +676,41 @@ def main():
     ap.add_argument("--top-frac", type=float, default=0.04, help="Top crop fraction")
     ap.add_argument("--bottom-frac", type=float, default=0.96, help="Bottom crop fraction")
     ap.add_argument("--gutter-frac", type=float, default=0.005, help="Half-gap around center")
+    ap.add_argument("--subject-map", help="Optional JSON mapping of header substrings to canonical subjects.")
 
     args = ap.parse_args()
+
+    subject_keywords = None
+    if args.subject_map:
+        try:
+            with open(args.subject_map, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                subject_keywords = {str(k): str(v) for k, v in data.items()}
+            else:
+                raise ValueError("subject map JSON must be an object of substring -> subject")
+        except Exception as exc:
+            raise SystemExit(f"Failed to load subject map: {exc}")
+
+    subject_arg = args.subject
+    auto_subject = False
+    if subject_arg is None or str(subject_arg).strip().lower() == "auto":
+        auto_subject = True
+        subject_arg = None
 
     app = MarginPreviewApp(
         pdf_path=args.pdf,
         out_path=args.out,
-        subject=args.subject,
+        subject=subject_arg,
         year=args.year,
         target=args.target,
         dpi=args.dpi,
         tol=args.tol,
         top_frac=args.top_frac,
         bottom_frac=args.bottom_frac,
-        gutter_frac=args.gutter_frac
+        gutter_frac=args.gutter_frac,
+        auto_subject=auto_subject,
+        subject_keywords=subject_keywords
     )
     app.mainloop()
 
