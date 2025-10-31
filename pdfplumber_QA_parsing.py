@@ -13,12 +13,14 @@ GUI preview to pick default margins from a chosen page, then parse QA:
 - Strip circled index (①/②/…) from option 'text' (kept only in 'index')
 - NEW: All text normalization collapses any whitespace (incl. newlines) to single spaces.
 - NEW: Optional automatic subject detection from page headers (use --subject auto).
+- NEW: Optional JPG previews for each extracted chunk (--chunk-preview-dir).
 
 Usage:
   python qa_gui_margins.py --pdf "C:\\path\\file.pdf" --out "C:\\path\\qa.json" --subject auto --year 2025 --target default
   # optional knobs:
   --dpi 180 --tol 1.5 --top-frac 0.04 --bottom-frac 0.96 --gutter-frac 0.005
   --subject-map header_map.json
+  --chunk-preview-dir chunk_previews --chunk-preview-dpi 180 --chunk-preview-pad 2.0
 """
 
 import os, re, json, argparse, tempfile
@@ -222,6 +224,40 @@ def group_words_into_lines(words: List[Dict[str, Any]], y_tol=3.0):
 def line_text(ln): return " ".join(w["text"] for w in ln).strip()
 def line_x0(ln):   return min(w["x0"] for w in ln)
 
+def lines_to_bbox(lines: List[List[Dict[str, Any]]], page_height: float):
+    """Return a PDF-coordinate bbox (x0, top, x1, bottom) covering the provided lines."""
+
+    xs0, xs1, tops, bottoms = [], [], [], []
+    for ln in lines:
+        for w in ln:
+            x0 = w.get("x0")
+            x1 = w.get("x1")
+            top = w.get("top")
+            bottom = w.get("bottom")
+            if None in (x0, x1, top, bottom):
+                continue
+            xs0.append(float(x0))
+            xs1.append(float(x1))
+            tops.append(float(top))
+            bottoms.append(float(bottom))
+
+    if not xs0:
+        return None
+
+    min_x0 = min(xs0)
+    max_x1 = max(xs1)
+
+    # pdfplumber's words expose top/bottom as distances from the top edge; convert to PDF coords
+    top_candidates = [page_height - b for b in bottoms]
+    bottom_candidates = [page_height - t for t in tops]
+
+    top_pdf = max(0.0, min(top_candidates))
+    bottom_pdf = min(page_height, max(bottom_candidates))
+    if top_pdf > bottom_pdf:
+        top_pdf, bottom_pdf = bottom_pdf, top_pdf
+
+    return (min_x0, top_pdf, max_x1, bottom_pdf)
+
 def detect_col_leftmost(page, bbox) -> Optional[float]:
     sub = page.within_bbox(bbox)
     xs = []
@@ -247,7 +283,13 @@ def chunk_column_by_margin(page, bbox, left_margin_x: Optional[float], tol: floa
         if not cur: return
         text = "\n".join(line_text(ln) for ln in cur).strip()
         if text:
-            chunks.append({"text": text})
+            chunk_bbox = lines_to_bbox(cur, float(page.height))
+            if chunk_bbox is None:
+                chunk_bbox = bbox
+            chunk = {"text": text}
+            if chunk_bbox is not None:
+                chunk["bbox"] = tuple(float(v) for v in chunk_bbox)
+            chunks.append(chunk)
         cur.clear()
 
     for ln in lines:
@@ -262,6 +304,51 @@ def chunk_column_by_margin(page, bbox, left_margin_x: Optional[float], tol: floa
                 pass
     flush()
     return chunks
+
+def save_chunk_preview(page,
+                       bbox,
+                       preview_dir: str,
+                       page_index: int,
+                       column_tag: str,
+                       column_chunk_idx: int,
+                       global_idx: int,
+                       dpi: int = 180,
+                       pad: float = 2.0) -> Optional[str]:
+    """Persist a JPG preview of the chunk defined by bbox. Returns absolute path or None."""
+
+    if not bbox or not preview_dir:
+        return None
+
+    abs_dir = os.path.abspath(os.path.expanduser(preview_dir))
+    try:
+        os.makedirs(abs_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"[warn] Failed to create preview directory '{abs_dir}': {exc}")
+        return None
+
+    width, height = float(page.width), float(page.height)
+    x0, top, x1, bottom = map(float, bbox)
+    pad = max(0.0, float(pad))
+    padded = (
+        max(0.0, x0 - pad),
+        max(0.0, top - pad),
+        min(width, x1 + pad),
+        min(height, bottom + pad),
+    )
+
+    try:
+        cropped_page = page.within_bbox(padded)
+        page_image = cropped_page.to_image(resolution=int(dpi))
+        pil = page_image.original.convert("RGB")
+        del page_image
+        filename = f"p{page_index:03d}_{column_tag}{column_chunk_idx:02d}_{global_idx:04d}.jpg"
+        out_path = os.path.join(abs_dir, filename)
+        pil.save(out_path, format="JPEG", quality=90)
+        pil.close()
+        return os.path.abspath(out_path)
+    except Exception as exc:
+        print(f"[warn] Failed to save preview for page {page_index} chunk {column_tag}{column_chunk_idx}: {exc}")
+        return None
 
 def extract_leading_qnum_and_clean(stem: str):
     """
@@ -337,11 +424,17 @@ def pdf_to_qa_margin_chunked(pdf_path: str,
                              top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005,
                              y_tol=3.0,
                              auto_subject: bool = False,
-                             subject_keywords: Optional[Dict[str, str]] = None) -> List[Dict[str, Any]]:
+                             subject_keywords: Optional[Dict[str, str]] = None,
+                             chunk_preview_dir: Optional[str] = None,
+                             chunk_preview_dpi: int = 180,
+                             chunk_preview_pad: float = 2.0) -> List[Dict[str, Any]]:
     out = []
     qnum = start_num
+    preview_dir = (os.path.abspath(os.path.expanduser(chunk_preview_dir))
+                   if chunk_preview_dir else None)
+    global_chunk_idx = 0
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+        for page_index, page in enumerate(pdf.pages, start=1):
             effective_subject = subject
             if auto_subject or subject is None:
                 detected, _header_text = detect_page_subject(page, subject_keywords=subject_keywords)
@@ -352,30 +445,54 @@ def pdf_to_qa_margin_chunked(pdf_path: str,
             L_chunks = chunk_column_by_margin(page, Lbbox, L_margin, tol, y_tol=y_tol) if L_margin is not None else []
             R_chunks = chunk_column_by_margin(page, Rbbox, R_margin, tol, y_tol=y_tol) if R_margin is not None else []
             # reading order: L then R per page
-            for ch in (L_chunks + R_chunks):
-                stem, options, dispute, detected_qnum = extract_qa_from_chunk_text(ch["text"])
-                if stem is None or not options:
-                    continue
+            for column_tag, column_chunks in (("L", L_chunks), ("R", R_chunks)):
+                for column_chunk_idx, ch in enumerate(column_chunks, start=1):
+                    stem, options, dispute, detected_qnum = extract_qa_from_chunk_text(ch["text"])
+                    if stem is None or not options:
+                        continue
 
-                # Prefer detected number from the stem; otherwise use running counter
-                qno = detected_qnum if detected_qnum is not None else qnum
+                    # Prefer detected number from the stem; otherwise use running counter
+                    qno = detected_qnum if detected_qnum is not None else qnum
 
-                out.append({
-                    "subject": (effective_subject if effective_subject is not None else ""),
-                    "year": year,
-                    "target": target,
-                    "content": {
-                        "question_number": qno,
-                        "question_text": stem,  # already normalized (no newlines)
-                        "dispute_bool": bool(dispute),
-                        "dispute_site": None,
-                        "options": options      # each option text normalized too
-                    }
-                })
+                    global_chunk_idx += 1
+                    preview_path = None
+                    if preview_dir and ch.get("bbox"):
+                        preview_path = save_chunk_preview(
+                            page,
+                            ch.get("bbox"),
+                            preview_dir,
+                            page_index,
+                            column_tag,
+                            column_chunk_idx,
+                            global_chunk_idx,
+                            dpi=chunk_preview_dpi,
+                            pad=chunk_preview_pad,
+                        )
 
-                # advance running counter only if we didn't detect a number
-                if detected_qnum is None:
-                    qnum += 1
+                    out.append({
+                        "subject": (effective_subject if effective_subject is not None else ""),
+                        "year": year,
+                        "target": target,
+                        "content": {
+                            "question_number": qno,
+                            "question_text": stem,  # already normalized (no newlines)
+                            "dispute_bool": bool(dispute),
+                            "dispute_site": None,
+                            "options": options,     # each option text normalized too
+                            "source": {
+                                "page": page_index,
+                                "column": column_tag,
+                                "chunk_index": column_chunk_idx,
+                            }
+                        }
+                    })
+
+                    if preview_path:
+                        out[-1]["content"]["preview_image"] = preview_path
+
+                    # advance running counter only if we didn't detect a number
+                    if detected_qnum is None:
+                        qnum += 1
     return out
 
 # ---------- GUI ----------
@@ -384,7 +501,10 @@ class MarginPreviewApp(tk.Tk):
                  subject: Optional[str], year: int, target: str,
                  dpi=180, tol=1.5, top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005,
                  auto_subject: bool = False,
-                 subject_keywords: Optional[Dict[str, str]] = None):
+                 subject_keywords: Optional[Dict[str, str]] = None,
+                 chunk_preview_dir: Optional[str] = None,
+                 chunk_preview_dpi: int = 180,
+                 chunk_preview_pad: float = 2.0):
         super().__init__()
         self.title("QA Margin Preview & Parser")
         self.geometry("1200x850")
@@ -400,6 +520,11 @@ class MarginPreviewApp(tk.Tk):
         self.target = target
         self.auto_subject = auto_subject or (subject is None)
         self.subject_keywords = subject_keywords or {}
+
+        self.chunk_preview_dir = (os.path.abspath(os.path.expanduser(chunk_preview_dir))
+                                  if chunk_preview_dir else None)
+        self.chunk_preview_dpi = max(1, int(chunk_preview_dpi))
+        self.chunk_preview_pad = max(0.0, float(chunk_preview_pad))
 
         self.dpi = dpi
         self.tol = tk.DoubleVar(value=float(tol))
@@ -455,8 +580,13 @@ class MarginPreviewApp(tk.Tk):
 
         ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8)
         ttk.Label(panel, text="Output").pack(anchor="w")
-        self.out_path_label = ttk.Label(panel, text=self.out_path, wraplength=220)
+        self.out_path_label = ttk.Label(panel, text=os.path.abspath(self.out_path), wraplength=220)
         self.out_path_label.pack(anchor="w")
+
+        ttk.Label(panel, text="Chunk preview JPG dir").pack(anchor="w", pady=(8,0))
+        preview_label_text = self.chunk_preview_dir if self.chunk_preview_dir else "(disabled)"
+        self.preview_dir_label = ttk.Label(panel, text=preview_label_text, wraplength=220)
+        self.preview_dir_label.pack(anchor="w")
 
         # Canvas
         self.canvas = tk.Canvas(self, bg="#1e1e1e", highlightthickness=0)
@@ -621,7 +751,7 @@ class MarginPreviewApp(tk.Tk):
             if not out_path:
                 return
             self.out_path = out_path
-            self.out_path_label.config(text=out_path)
+            self.out_path_label.config(text=os.path.abspath(out_path))
 
         try:
             qa = pdf_to_qa_margin_chunked(
@@ -635,7 +765,10 @@ class MarginPreviewApp(tk.Tk):
                 gutter_frac=float(self.gutter_frac.get()),
                 y_tol=3.0,
                 auto_subject=self.auto_subject,
-                subject_keywords=self.subject_keywords
+                subject_keywords=self.subject_keywords,
+                chunk_preview_dir=self.chunk_preview_dir,
+                chunk_preview_dpi=self.chunk_preview_dpi,
+                chunk_preview_pad=self.chunk_preview_pad,
             )
         except Exception as e:
             messagebox.showerror("Parse failed", str(e))
@@ -648,7 +781,26 @@ class MarginPreviewApp(tk.Tk):
             messagebox.showerror("Save failed", str(e))
             return
 
-        messagebox.showinfo("Done", f"Wrote {len(qa)} QA items →\n{os.path.abspath(self.out_path)}")
+        preview_count = sum(
+            1
+            for item in qa
+            if isinstance(item, dict)
+            and isinstance(item.get("content"), dict)
+            and item["content"].get("preview_image")
+        )
+
+        msg_lines = [
+            f"Wrote {len(qa)} QA items →",
+            os.path.abspath(self.out_path),
+        ]
+        if preview_count and self.chunk_preview_dir:
+            msg_lines.extend([
+                "",
+                f"Saved {preview_count} chunk previews →",
+                self.chunk_preview_dir,
+            ])
+
+        messagebox.showinfo("Done", "\n".join(msg_lines))
 
     def destroy(self):
         # clean temp image on exit (safe even if Windows still holds a handle; ignore errors)
@@ -677,6 +829,11 @@ def main():
     ap.add_argument("--bottom-frac", type=float, default=0.96, help="Bottom crop fraction")
     ap.add_argument("--gutter-frac", type=float, default=0.005, help="Half-gap around center")
     ap.add_argument("--subject-map", help="Optional JSON mapping of header substrings to canonical subjects.")
+    ap.add_argument("--chunk-preview-dir", help="Directory to store JPG previews for each extracted chunk.")
+    ap.add_argument("--chunk-preview-dpi", type=int, default=180,
+                    help="DPI for chunk preview JPG crops (default 180).")
+    ap.add_argument("--chunk-preview-pad", type=float, default=2.0,
+                    help="Padding (points) added around each chunk preview crop (default 2).")
 
     args = ap.parse_args()
 
@@ -698,6 +855,8 @@ def main():
         auto_subject = True
         subject_arg = None
 
+    chunk_preview_dir_arg = args.chunk_preview_dir.strip() if args.chunk_preview_dir else None
+
     app = MarginPreviewApp(
         pdf_path=args.pdf,
         out_path=args.out,
@@ -710,7 +869,10 @@ def main():
         bottom_frac=args.bottom_frac,
         gutter_frac=args.gutter_frac,
         auto_subject=auto_subject,
-        subject_keywords=subject_keywords
+        subject_keywords=subject_keywords,
+        chunk_preview_dir=chunk_preview_dir_arg,
+        chunk_preview_dpi=args.chunk_preview_dpi,
+        chunk_preview_pad=args.chunk_preview_pad
     )
     app.mainloop()
 
