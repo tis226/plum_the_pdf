@@ -418,7 +418,16 @@ def flow_chunk_all_pages(pdf, L_rel_offset, R_rel_offset, y_tol, tol, top_frac, 
                 i += 1
     if current is not None:
         chunks.append(current)
-    return chunks
+
+    per_page_boxes = {i: [] for i in range(len(pdf.pages))}
+    for ch_id, ch in enumerate(chunks, start=1):
+        for p in ch.get("pieces", []):
+            b = p["box"].copy()
+            b["chunk_id"] = ch_id
+            b["col"] = p["col"]
+            per_page_boxes[p["page"]].append(b)
+
+    return chunks, per_page_boxes
 
 # =========================
 # QA extraction
@@ -531,7 +540,7 @@ def pdf_to_qa_flow_chunks(pdf_path: str,
             elif clip_mode == "band":
                 band_map[i] = header_clip_band(pg, band_pt=header_band_pt, xpad=header_band_xpad)
 
-        chunks = flow_chunk_all_pages(
+        chunks, _ = flow_chunk_all_pages(
             pdf, L_rel, R_rel, y_tol, tol,
             top_frac, bottom_frac, gutter_frac,
             clip_mode=clip_mode, ycut_map=ycut_map, band_map=band_map
