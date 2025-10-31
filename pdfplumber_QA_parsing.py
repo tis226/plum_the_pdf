@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+qa_gui_margins.py
+
+GUI preview to pick default margins from a chosen page, then parse QA:
+- Two-column crop (top/bottom/gutter fractions)
+- Detect leftmost x within each column (red guide lines)
+- Button: "Use this page's margins for ALL pages"
+- Optional: Export margins.json
+- Parse: question_text ends at first '①'; options split by circled numerals
+- Detect leading question number in stem -> use as 'question_number'
+- Strip circled index (①/②/…) from option 'text' (kept only in 'index')
+- NEW: All text normalization collapses any whitespace (incl. newlines) to single spaces.
+
+Usage:
+  python qa_gui_margins.py --pdf "C:\\path\\file.pdf" --out "C:\\path\\qa.json" --subject 형법 --year 2025 --target default
+  # optional knobs:
+  --dpi 180 --tol 1.5 --top-frac 0.04 --bottom-frac 0.96 --gutter-frac 0.005
+"""
+
+import os, re, json, argparse, tempfile
+from typing import List, Dict, Any, Optional, Tuple
+
+import pdfplumber
+
+# GUI deps
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from PIL import Image, ImageTk
+
+# ---------- Parsing regex/config ----------
+CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+OPT_SPLIT_RE = re.compile(rf"(?=([{CIRCLED}]))", re.UNICODE)
+DISPUTE_RE   = re.compile(r"\(다툼이\s*있는\s*경우\s*판례에\s*의함\)", re.UNICODE)
+
+# Detect a leading question number in the stem (before the first ①)
+# Matches: "16.", "16 )", "(16)", "16번", "16 ." etc.
+QUESTION_NUM_RE = re.compile(
+    r"^\s*(?:\(\s*(\d{1,3})\s*\)|(\d{1,3})\s*번|(\d{1,3}))\s*[.)]?\s*",
+    re.UNICODE
+)
+
+# For noisy sources, make sure option text never keeps the circled index
+CIRCLED_STRIP_RE = re.compile(rf"^[{CIRCLED}]\s*")
+
+def norm_space(s: str) -> str:
+    """
+    Collapse ANY whitespace (including newlines/tabs) to single spaces and trim.
+    """
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+# ---------- Layout helpers ----------
+def two_col_bboxes(page, top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005):
+    w, h = float(page.width), float(page.height)
+    top = h * top_frac
+    bottom = h * bottom_frac
+    gutter = w * gutter_frac
+    mid = w * 0.5
+    return (0.0, top,  mid - gutter, bottom), (mid + gutter, top, w, bottom)
+
+def extract_words_in_bbox(page, bbox, x_tol=3, y_tol=3):
+    sub = page.within_bbox(bbox)
+    return sub.extract_words(x_tolerance=x_tol, y_tolerance=y_tol,
+                             keep_blank_chars=False, use_text_flow=True) or []
+
+def group_words_into_lines(words: List[Dict[str, Any]], y_tol=3.0):
+    if not words: return []
+    ws = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines, cur, cur_top = [], [], None
+    for w in ws:
+        if cur_top is None or abs(w["top"] - cur_top) <= y_tol:
+            cur.append(w)
+            if cur_top is None: cur_top = w["top"]
+        else:
+            cur.sort(key=lambda x: x["x0"]); lines.append(cur)
+            cur = [w]; cur_top = w["top"]
+    if cur: cur.sort(key=lambda x: x["x0"]); lines.append(cur)
+    return lines
+
+def line_text(ln): return " ".join(w["text"] for w in ln).strip()
+def line_x0(ln):   return min(w["x0"] for w in ln)
+
+def detect_col_leftmost(page, bbox) -> Optional[float]:
+    sub = page.within_bbox(bbox)
+    xs = []
+    if sub.chars:
+        xs = [c["x0"] for c in sub.chars if c.get("x0") is not None]
+    if not xs:
+        words = extract_words_in_bbox(page, bbox)
+        xs = [w["x0"] for w in words if w.get("x0") is not None]
+    if not xs: return None
+    return float(min(xs))
+
+# ---------- Margin-chunking + QA ----------
+def chunk_column_by_margin(page, bbox, left_margin_x: Optional[float], tol: float,
+                           y_tol=3.0) -> List[Dict[str, Any]]:
+    if left_margin_x is None:
+        return []
+    words = extract_words_in_bbox(page, bbox)
+    lines = group_words_into_lines(words, y_tol=y_tol)
+
+    chunks, cur = [], []
+
+    def flush():
+        if not cur: return
+        text = "\n".join(line_text(ln) for ln in cur).strip()
+        if text:
+            chunks.append({"text": text})
+        cur.clear()
+
+    for ln in lines:
+        x0 = line_x0(ln)
+        if abs(x0 - left_margin_x) <= tol:
+            flush()
+            cur.append(ln)
+        else:
+            if cur:
+                cur.append(ln)
+            else:
+                pass
+    flush()
+    return chunks
+
+def extract_leading_qnum_and_clean(stem: str):
+    """
+    Return (qnum:int|None, cleaned_stem:str)
+    Strips a leading question number token if present and returns it.
+    """
+    if not stem:
+        return None, stem
+    m = QUESTION_NUM_RE.match(stem)
+    if not m:
+        return None, stem
+    digits = next((g for g in m.groups() if g), None)
+    try:
+        qnum = int(digits) if digits is not None else None
+    except Exception:
+        qnum = None
+    cleaned = stem[m.end():].lstrip()
+    return qnum, cleaned
+
+def extract_qa_from_chunk_text(text: str):
+    """
+    Return (stem, options, dispute_bool, detected_qnum)
+      - stem ends at first '①'
+      - options split by circled numerals
+      - detected_qnum comes from the beginning of the stem (e.g., '16.')
+      - NEW: all whitespace collapsed to single spaces
+    """
+    if not text:
+        return None, None, False, None
+
+    first = text.find("①")
+    if first == -1:
+        return None, None, False, None
+
+    stem = text[:first]
+    opts_blob = text[first:]
+
+    # dispute flag
+    dispute = bool(DISPUTE_RE.search(stem))
+    stem = DISPUTE_RE.sub("", stem)
+    stem = norm_space(stem)
+
+    # pull leading question number from stem (and remove it from stem)
+    detected_qnum, stem = extract_leading_qnum_and_clean(stem)
+    stem = norm_space(stem)  # normalize again after removing number
+
+    # split options
+    parts = [p for p in OPT_SPLIT_RE.split(opts_blob) if p]
+    options = []
+    i = 0
+    while i < len(parts):
+        sym = parts[i].strip()
+        if sym and sym[0] in CIRCLED:
+            raw_txt = parts[i+1] if (i+1) < len(parts) else ""
+            # strip circled index from the option text; keep only in 'index'
+            clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
+            options.append({"index": sym[0], "text": clean_txt})
+            i += 2
+        else:
+            i += 1
+
+    options = [o for o in options if o["index"] in CIRCLED]
+    if not options:
+        return None, None, dispute, detected_qnum
+
+    return stem, options, dispute, detected_qnum
+
+def pdf_to_qa_margin_chunked(pdf_path: str,
+                             subject: str, year: int, target: str,
+                             start_num: int,
+                             L_margin: Optional[float], R_margin: Optional[float],
+                             tol: float,
+                             top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005,
+                             y_tol=3.0) -> List[Dict[str, Any]]:
+    out = []
+    qnum = start_num
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            Lbbox, Rbbox = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
+            L_chunks = chunk_column_by_margin(page, Lbbox, L_margin, tol, y_tol=y_tol) if L_margin is not None else []
+            R_chunks = chunk_column_by_margin(page, Rbbox, R_margin, tol, y_tol=y_tol) if R_margin is not None else []
+            # reading order: L then R per page
+            for ch in (L_chunks + R_chunks):
+                stem, options, dispute, detected_qnum = extract_qa_from_chunk_text(ch["text"])
+                if stem is None or not options:
+                    continue
+
+                # Prefer detected number from the stem; otherwise use running counter
+                qno = detected_qnum if detected_qnum is not None else qnum
+
+                out.append({
+                    "subject": subject,
+                    "year": year,
+                    "target": target,
+                    "content": {
+                        "question_number": qno,
+                        "question_text": stem,  # already normalized (no newlines)
+                        "dispute_bool": bool(dispute),
+                        "dispute_site": None,
+                        "options": options      # each option text normalized too
+                    }
+                })
+
+                # advance running counter only if we didn't detect a number
+                if detected_qnum is None:
+                    qnum += 1
+    return out
+
+# ---------- GUI ----------
+class MarginPreviewApp(tk.Tk):
+    def __init__(self, pdf_path: str, out_path: str,
+                 subject: str, year: int, target: str,
+                 dpi=180, tol=1.5, top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005):
+        super().__init__()
+        self.title("QA Margin Preview & Parser")
+        self.geometry("1200x850")
+        self.minsize(900, 700)
+
+        self.pdf_path = pdf_path
+        self.out_path = out_path
+        self.subject = subject
+        self.year = year
+        self.target = target
+
+        self.dpi = dpi
+        self.tol = tk.DoubleVar(value=float(tol))
+        self.top_frac = tk.DoubleVar(value=float(top_frac))
+        self.bottom_frac = tk.DoubleVar(value=float(bottom_frac))
+        self.gutter_frac = tk.DoubleVar(value=float(gutter_frac))
+
+        self.L_margin = None
+        self.R_margin = None
+
+        self.tk_img = None
+        self._tmp_png = None
+        self.current_idx = 0
+
+        # Layout
+        self.columnconfigure(0, weight=0)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=0)
+
+        # Left control panel
+        panel = ttk.Frame(self, padding=8)
+        panel.grid(row=0, column=0, sticky="ns")
+
+        ttk.Label(panel, text="Navigation").pack(anchor="w", pady=(0,4))
+        nav = ttk.Frame(panel); nav.pack(anchor="w", pady=(0,8))
+        ttk.Button(nav, text="◀ Prev", command=self.prev_page, width=10).pack(side="left")
+        ttk.Button(nav, text="Next ▶", command=self.next_page, width=10).pack(side="left", padx=(6,0))
+
+        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8)
+
+        ttk.Label(panel, text="Column crop (fractions)").pack(anchor="w", pady=(0,4))
+        cf = ttk.Frame(panel); cf.pack(anchor="w", pady=(0,8))
+        ttk.Label(cf, text="Top").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cf, textvariable=self.top_frac, width=7).grid(row=0, column=1, padx=(4,0))
+        ttk.Label(cf, text="Bottom").grid(row=1, column=0, sticky="w")
+        ttk.Entry(cf, textvariable=self.bottom_frac, width=7).grid(row=1, column=1, padx=(4,0))
+        ttk.Label(cf, text="Gutter").grid(row=2, column=0, sticky="w")
+        ttk.Entry(cf, textvariable=self.gutter_frac, width=7).grid(row=2, column=1, padx=(4,0))
+        ttk.Button(cf, text="Apply crop", command=self.refresh).grid(row=3, column=0, columnspan=2, pady=(6,0), sticky="ew")
+
+        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8)
+
+        ttk.Label(panel, text="Margin tolerance (pt)").pack(anchor="w", pady=(0,4))
+        ttk.Entry(panel, textvariable=self.tol, width=8).pack(anchor="w")
+        ttk.Label(panel, text="Detected margins").pack(anchor="w", pady=(8,4))
+        self.marg_label = ttk.Label(panel, text="L: —   R: —")
+        self.marg_label.pack(anchor="w")
+
+        ttk.Button(panel, text="Use this page's margins for ALL pages", command=self.assign_margins, width=28).pack(anchor="w", pady=(10,0))
+        ttk.Button(panel, text="Export margins.json…", command=self.export_margins, width=28).pack(anchor="w", pady=(6,0))
+        ttk.Button(panel, text="Parse → QA JSON", command=self.parse_all, width=28).pack(anchor="w", pady=(12,0))
+
+        ttk.Separator(panel, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Label(panel, text="Output").pack(anchor="w")
+        self.out_path_label = ttk.Label(panel, text=self.out_path, wraplength=220)
+        self.out_path_label.pack(anchor="w")
+
+        # Canvas
+        self.canvas = tk.Canvas(self, bg="#1e1e1e", highlightthickness=0)
+               # ... snip highlight thickness kept ...
+        self.canvas.grid(row=0, column=1, sticky="nsew", padx=8, pady=8)
+        self.canvas.bind("<Configure>", lambda e: self.render_page())
+
+        # Status
+        status = ttk.Frame(self, padding=8)
+        status.grid(row=1, column=0, columnspan=2, sticky="ew")
+        status.columnconfigure(0, weight=1)
+        self.info = ttk.Label(status, text="")
+        self.info.grid(row=0, column=0, sticky="w")
+
+        # Load PDF
+        try:
+            self.pdf = pdfplumber.open(self.pdf_path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open PDF:\n{e}")
+            self.destroy(); return
+
+        self.num_pages = len(self.pdf.pages)
+        self.bind("<Left>", lambda e: self.prev_page())
+        self.bind("<Right>", lambda e: self.next_page())
+
+        self.render_page()
+
+    # ---- GUI actions ----
+    def page_bboxes_and_margins(self):
+        page = self.pdf.pages[self.current_idx]
+        Lbbox, Rbbox = two_col_bboxes(page, self.top_frac.get(), self.bottom_frac.get(), self.gutter_frac.get())
+        Lx = detect_col_leftmost(page, Lbbox)
+        Rx = detect_col_leftmost(page, Rbbox)
+        return page, Lbbox, Rbbox, Lx, Rx
+
+    def render_page(self):
+        # render base page
+        page, Lbbox, Rbbox, Lx, Rx = self.page_bboxes_and_margins()
+
+        im = page.to_image(resolution=int(self.dpi))
+        # draw column boxes (light blue)
+        for (x0, top, x1, bottom) in (Lbbox, Rbbox):
+            im.draw_rect((x0, top, x1, bottom), stroke="#66B2FF", stroke_width=3)
+        # draw red margin lines across each column (short marker at 6% depth)
+        def draw_margin_line(x, bbox):
+            if x is None: return
+            x0, top, x1, bottom = bbox
+            y = top + (bottom - top) * 0.06
+            im.draw_line([(x0, y), (x, y)], stroke="red", stroke_width=4)
+        draw_margin_line(Lx, Lbbox)
+        draw_margin_line(Rx, Rbbox)
+
+        # replace temp file (ensure old is removed after the new image is not locked)
+        new_tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        new_path = new_tmp.name
+        new_tmp.close()
+        im.save(new_path)
+
+        # --- Fit into canvas (safe, no file lock on disk file) ---
+        with Image.open(new_path) as _pil:
+            pil = _pil.copy()  # detach from file; allow deletion afterwards
+
+        # delete previous tmp *now* (old PhotoImage already owns its pixels)
+        if self._tmp_png and os.path.exists(self._tmp_png):
+            try:
+                os.remove(self._tmp_png)
+            except PermissionError:
+                pass
+        self._tmp_png = new_path
+
+        # scale image to canvas
+        cw = max(100, self.canvas.winfo_width())
+        ch = max(100, self.canvas.winfo_height())
+        scale = min(cw / pil.width, ch / pil.height, 1.0)
+        tw = max(1, int(round(pil.width * scale)))
+        th = max(1, int(round(pil.height * scale)))
+        if (tw, th) != (pil.width, pil.height):
+            pil = pil.resize((tw, th), Image.LANCZOS)
+
+        self.tk_img = ImageTk.PhotoImage(pil)
+        self.canvas.delete("all")
+        self.canvas.create_image(cw // 2, ch // 2, image=self.tk_img)
+
+        # update info + detected margins readout
+        self.info.config(text=f"Page {self.current_idx+1}/{self.num_pages}  |  tol = {self.tol.get():.2f} pt")
+        ml = "—" if Lx is None else f"{Lx:.2f}"
+        mr = "—" if Rx is None else f"{Rx:.2f}"
+        self.marg_label.config(text=f"L: {ml}   R: {mr}")
+
+    def refresh(self):
+        self.render_page()
+
+    def prev_page(self):
+        if self.current_idx > 0:
+            self.current_idx -= 1
+            self.render_page()
+
+    def next_page(self):
+        if self.current_idx < self.num_pages - 1:
+            self.current_idx += 1
+            self.render_page()
+
+    def assign_margins(self):
+        # use current page’s detected margins as defaults
+        _, _, _, Lx, Rx = self.page_bboxes_and_margins()
+        if Lx is None and Rx is None:
+            messagebox.showwarning("No margins", "Could not detect margins on this page.")
+            return
+        self.L_margin = None if Lx is None else float(Lx)
+        self.R_margin = None if Rx is None else float(Rx)
+        messagebox.showinfo("Assigned", f"Assigned margins from page {self.current_idx+1}:\n"
+                                        f"L = {self.L_margin if self.L_margin is not None else '—'}\n"
+                                        f"R = {self.R_margin if self.R_margin is not None else '—'}")
+
+    def export_margins(self):
+        if self.L_margin is None and self.R_margin is None:
+            if not messagebox.askyesno("No assigned margins",
+                                       "You haven't assigned margins yet.\nExport detected values from this page instead?"):
+                return
+            _, _, _, Lx, Rx = self.page_bboxes_and_margins()
+            L_export = Lx
+            R_export = Rx
+        else:
+            L_export = self.L_margin
+            R_export = self.R_margin
+
+        if L_export is None and R_export is None:
+            messagebox.showwarning("No margins", "No margins to export.")
+            return
+
+        path = filedialog.asksaveasfilename(defaultextension=".json",
+                                            filetypes=[("JSON","*.json")],
+                                            initialfile="margins.json",
+                                            title="Export margins.json")
+        if not path:
+            return
+        data = {"global": {}, "pages": {}}
+        if L_export is not None: data["global"]["L"] = float(L_export)
+        if R_export is not None: data["global"]["R"] = float(R_export)
+        data["global"]["tol"] = float(self.tol.get())
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        messagebox.showinfo("Exported", f"Saved: {os.path.abspath(path)}")
+
+    def parse_all(self):
+        # ensure margins are set (fallback to current page detection)
+        if self.L_margin is None and self.R_margin is None:
+            _, _, _, Lx, Rx = self.page_bboxes_and_margins()
+            self.L_margin = None if Lx is None else float(Lx)
+            self.R_margin = None if Rx is None else float(Rx)
+        if self.L_margin is None and self.R_margin is None:
+            messagebox.showwarning("No margins", "No margins assigned/detected; cannot parse.")
+            return
+
+        # pick output path if the provided --out points to a directory
+        out_path = self.out_path
+        if os.path.isdir(out_path):
+            out_path = filedialog.asksaveasfilename(defaultextension=".json",
+                                                    filetypes=[("JSON","*.json")],
+                                                    initialfile="qa.json",
+                                                    title="Save QA JSON")
+            if not out_path:
+                return
+            self.out_path = out_path
+            self.out_path_label.config(text=out_path)
+
+        try:
+            qa = pdf_to_qa_margin_chunked(
+                pdf_path=self.pdf_path,
+                subject=self.subject, year=self.year, target=self.target,
+                start_num=1,
+                L_margin=self.L_margin, R_margin=self.R_margin,
+                tol=float(self.tol.get()),
+                top_frac=float(self.top_frac.get()),
+                bottom_frac=float(self.bottom_frac.get()),
+                gutter_frac=float(self.gutter_frac.get()),
+                y_tol=3.0
+            )
+        except Exception as e:
+            messagebox.showerror("Parse failed", str(e))
+            return
+
+        try:
+            with open(self.out_path, "w", encoding="utf-8") as f:
+                json.dump(qa, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            return
+
+        messagebox.showinfo("Done", f"Wrote {len(qa)} QA items →\n{os.path.abspath(self.out_path)}")
+
+    def destroy(self):
+        # clean temp image on exit (safe even if Windows still holds a handle; ignore errors)
+        try:
+            if self._tmp_png and os.path.exists(self._tmp_png):
+                os.remove(self._tmp_png)
+        except PermissionError:
+            pass
+        try: self.pdf.close()
+        except: pass
+        super().destroy()
+
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser(description="Preview margins, assign defaults, and parse QA from PDF.")
+    ap.add_argument("--pdf", required=True, help="Path to PDF")
+    ap.add_argument("--out", required=True, help="Path to write QA JSON (file path; if folder, dialog will prompt)")
+    ap.add_argument("--subject", required=True, help="Subject (e.g., 형법)")
+    ap.add_argument("--year", type=int, required=True, help="Year (e.g., 2025)")
+    ap.add_argument("--target", default="default", help="Target label")
+
+    ap.add_argument("--dpi", type=int, default=180, help="Preview DPI (default 180)")
+    ap.add_argument("--tol", type=float, default=1.5, help="Margin hit tolerance (points)")
+    ap.add_argument("--top-frac", type=float, default=0.04, help="Top crop fraction")
+    ap.add_argument("--bottom-frac", type=float, default=0.96, help="Bottom crop fraction")
+    ap.add_argument("--gutter-frac", type=float, default=0.005, help="Half-gap around center")
+
+    args = ap.parse_args()
+
+    app = MarginPreviewApp(
+        pdf_path=args.pdf,
+        out_path=args.out,
+        subject=args.subject,
+        year=args.year,
+        target=args.target,
+        dpi=args.dpi,
+        tol=args.tol,
+        top_frac=args.top_frac,
+        bottom_frac=args.bottom_frac,
+        gutter_frac=args.gutter_frac
+    )
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
