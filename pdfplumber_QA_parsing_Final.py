@@ -84,11 +84,38 @@ SUBJECT_CANDIDATES = list(dict.fromkeys(SUBJECT_CANDIDATES))
 CANDIDATE_SET = {_norm_header_token(x): x for x in SUBJECT_CANDIDATES}
 CANDIDATE_COLLAPSED = {_norm_collapse(x): x for x in SUBJECT_CANDIDATES}
 
-CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
-OPT_SPLIT_RE = re.compile(rf"(?=([{CIRCLED}]))")
-CIRCLED_STRIP_RE = re.compile(rf"^[{CIRCLED}]\s*")
+OPTION_RANGES = [
+    (0x2460, 0x2473),  # ①-⑳
+    (0x2474, 0x2487),  # ⑴-⒇
+    (0x2488, 0x249B),  # ⒈-⒛
+    (0x24F5, 0x24FE),  # ⓵-⓾
+]
+OPTION_EXTRA = {0x24EA, 0x24FF, 0x24DB}  # ⓪, ⓿, ⓛ
+OPTION_SET = {
+    chr(cp)
+    for start, end in OPTION_RANGES
+    for cp in range(start, end + 1)
+}
+OPTION_SET.update(chr(cp) for cp in OPTION_EXTRA)
+OPTION_CLASS = "".join(sorted(OPTION_SET))
+QUESTION_CIRCLED_RANGE = f"{OPTION_CLASS}{chr(0x3250)}-{chr(0x32FF)}"
 
-QUESTION_START_LINE_RE = re.compile(rf"^\s*(?:[{CIRCLED}]|[0-9]{{1,3}}[.)]|제\s*[0-9]{{1,3}}\s*문)")
+OPTION_HEADER_TOKENS = {
+    "보기",
+    "보기문",
+    "보기자료",
+    "보기지문",
+    "다음보기",
+    "보기문제",
+}
+
+OPT_SPLIT_RE = re.compile(rf"(?=([{OPTION_CLASS}]))")
+CIRCLED_STRIP_RE = re.compile(rf"^[{OPTION_CLASS}]\s*")
+
+QUESTION_START_LINE_RE = re.compile(
+    rf"^\s*(?:[{QUESTION_CIRCLED_RANGE}]|[0-9]{{1,3}}[.)]|제\s*[0-9]{{1,3}}\s*문)",
+    re.MULTILINE,
+)
 QUESTION_NUM_RE = re.compile(r"^\s*(?:\(\s*(\d{1,3})\s*\)|(\d{1,3})\s*번|(\d{1,3}))\s*[.)]?\s*")
 
 DISPUTE_RE = re.compile(
@@ -345,16 +372,43 @@ def extract_lines_in_bbox(page, bbox, y_tol=3.0,
         out.append({"x0": lx0, "x1": lx1, "top": top, "bottom": bot, "y": 0.5*(top+bot), "text": txt})
     return out
 
-def detect_question_starts(lines, margin_abs: Optional[float], col_left: float, tol=1.0):
+def _extract_qnum_from_text(text: str) -> Optional[int]:
+    m = QUESTION_NUM_RE.match(text.strip())
+    if not m:
+        return None
+    raw = next((g for g in m.groups() if g), None)
+    if raw is None:
+        return None
+    try:
+        num = int(raw)
+    except Exception:
+        return None
+    if num >= 1000:
+        return None
+    return num
+
+
+def detect_question_starts(lines, margin_abs: Optional[float], col_left: float,
+                           tol=1.0, last_qnum: Optional[int] = None):
     starts = []
     target_rel = None if margin_abs is None else (margin_abs - col_left)
+    current_last = last_qnum
     for i, ln in enumerate(lines):
+        text = (ln.get("text") or "").strip()
+        if not text:
+            continue
         rel = ln["x0"] - col_left
         left_ok = True if target_rel is None else abs(rel - target_rel) <= tol
-        text_ok = bool(QUESTION_START_LINE_RE.search(ln["text"]))
-        if left_ok and text_ok:
+        text_ok = bool(QUESTION_START_LINE_RE.match(text))
+        if not text_ok:
+            continue
+        qnum = _extract_qnum_from_text(text)
+        seq_ok = qnum is not None and (current_last is None or qnum == current_last + 1)
+        if left_ok or seq_ok:
             starts.append(i)
-    return starts
+            if qnum is not None:
+                current_last = qnum
+    return starts, current_last
 
 def build_flow_segments(pdf, top_frac, bottom_frac, gutter_frac, y_tol,
                         clip_mode: str,
@@ -389,8 +443,12 @@ def flow_chunk_all_pages(pdf, L_rel_offset, R_rel_offset, y_tol, tol, top_frac, 
         seg_meta.append((pi, col, bbox, lines, margin_abs, col_left))
 
     seg_starts = []
+    last_detected_qnum = None
     for (pi, col, bbox, lines, m_abs, col_left) in seg_meta:
-        seg_starts.append(detect_question_starts(lines, m_abs, col_left, tol=tol))
+        starts, last_detected_qnum = detect_question_starts(
+            lines, m_abs, col_left, tol=tol, last_qnum=last_detected_qnum
+        )
+        seg_starts.append(starts)
 
     chunks, current = [], None
     for seg_idx, (pi, col, bbox, lines, m_abs, col_left) in enumerate(seg_meta):
@@ -419,6 +477,48 @@ def flow_chunk_all_pages(pdf, L_rel_offset, R_rel_offset, y_tol, tol, top_frac, 
     if current is not None:
         chunks.append(current)
 
+    def _is_option_only_chunk(chunk):
+        lines = []
+        for piece in chunk.get("pieces", []):
+            text = piece.get("text") or ""
+            for raw_line in text.splitlines():
+                stripped = raw_line.strip()
+                if stripped:
+                    lines.append(stripped)
+        if not lines:
+            return False
+        if len(lines) > 10:
+            return False
+
+        header_allowance = 0
+        option_lines = 0
+
+        for line in lines:
+            first = next((ch for ch in line if not ch.isspace()), None)
+            if first and first in OPTION_SET:
+                option_lines += 1
+                continue
+
+            compact = re.sub(r"[\s<>()\[\]{}:：·•]", "", line)
+            if compact in OPTION_HEADER_TOKENS:
+                header_allowance += 1
+                if header_allowance > 1:
+                    return False
+                continue
+
+            return False
+
+        return option_lines > 0
+
+    merged_chunks = []
+    for chunk in chunks:
+        if merged_chunks and _is_option_only_chunk(chunk):
+            merged_chunks[-1].setdefault("pieces", []).extend(chunk.get("pieces", []))
+            continue
+        merged_chunks.append(chunk)
+
+    chunks = merged_chunks
+
     per_page_boxes = {i: [] for i in range(len(pdf.pages))}
     for ch_id, ch in enumerate(chunks, start=1):
         for p in ch.get("pieces", []):
@@ -441,14 +541,68 @@ def extract_leading_qnum_and_clean(stem: str):
     except Exception: qnum = None
     return qnum, stem[m.end():].lstrip()
 
+def _trim_to_first_question(text: str) -> Tuple[str, Optional[int]]:
+    if not text:
+        return text, None
+    m = QUESTION_START_LINE_RE.search(text)
+    if not m:
+        return text, None
+    trimmed = text[m.start():]
+    digits = None
+    dm = QUESTION_NUM_RE.match(trimmed)
+    if dm:
+        raw = next((g for g in dm.groups() if g), None)
+        try:
+            digits = int(raw) if raw is not None else None
+        except Exception:
+            digits = None
+    return trimmed, digits
+
+def sanitize_chunk_text(text: str, expected_next_qnum: Optional[int]) -> str:
+    if not text:
+        return text
+
+    trimmed, current_qnum = _trim_to_first_question(text)
+    text = trimmed
+
+    if current_qnum is not None:
+        target_next = current_qnum + 1
+    else:
+        target_next = expected_next_qnum
+
+    if target_next is None:
+        return text
+
+    for match in QUESTION_START_LINE_RE.finditer(text):
+        if match.start() == 0:
+            continue
+        candidate_slice = text[match.start():]
+        dm = QUESTION_NUM_RE.match(candidate_slice)
+        if not dm:
+            continue
+        raw = next((g for g in dm.groups() if g), None)
+        if raw is None:
+            continue
+        try:
+            num = int(raw)
+        except Exception:
+            continue
+        if num >= 1000:  # likely a date/year, skip trimming
+            continue
+        if num == target_next:
+            return text[:match.start()].rstrip()
+
+    return text
+
 def extract_qa_from_chunk_text(text: str):
     if not text: return None, None, False, None, None
     text = _strip_header_garbage(text)
 
-    first = text.find("①")
-    if first == -1:
+    first_match = re.search(rf"[{OPTION_CLASS}]", text)
+    if not first_match:
         return None, None, False, None, None
 
+    first = first_match.start()
     stem, opts_blob = text[:first], text[first:]
 
     dispute, dispute_site, stem = parse_dispute(stem, keep_text=True)
@@ -462,14 +616,14 @@ def extract_qa_from_chunk_text(text: str):
     i = 0
     while i < len(parts):
         sym = parts[i].strip()
-        if sym and sym[0] in CIRCLED:
+        if sym and sym[0] in OPTION_SET:
             raw_txt = parts[i+1] if (i+1) < len(parts) else ""
             clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
             options.append({"index": sym[0], "text": clean_txt})
             i += 2
         else:
             i += 1
-    options = [o for o in options if o["index"] in CIRCLED]
+    options = [o for o in options if o["index"] in OPTION_SET]
     if not options:
         return None, None, dispute, dispute_site, detected_qnum
 
@@ -521,7 +675,7 @@ def pdf_to_qa_flow_chunks(pdf_path: str,
                           chunk_preview_dpi: int = 220,
                           chunk_preview_pad: float = 2.0):
     out = []
-    qnum = start_num
+    last_assigned_qno = start_num - 1
     global_idx = 0
     preview_dir = os.path.abspath(os.path.expanduser(chunk_preview_dir)) if chunk_preview_dir else None
 
@@ -553,14 +707,21 @@ def pdf_to_qa_flow_chunks(pdf_path: str,
             if p1 in skip_pages:
                 continue
 
+            expected_next = last_assigned_qno + 1 if last_assigned_qno is not None else None
             text = "\n".join(p["text"] for p in pieces if p.get("text"))
+            text = sanitize_chunk_text(text, expected_next)
             stem, options, dispute, dispute_site, detected_qnum = extract_qa_from_chunk_text(text)
             if stem is None or not options:
                 continue
 
             subj = inh_subject.get(p1) or subject_default
             targ = inh_target.get(p1)  or target_default
-            qno  = detected_qnum if detected_qnum is not None else qnum
+            if detected_qnum is not None:
+                qno = detected_qnum
+            elif expected_next is not None:
+                qno = expected_next
+            else:
+                qno = start_num
             global_idx += 1
 
             preview_path = None
@@ -586,8 +747,7 @@ def pdf_to_qa_flow_chunks(pdf_path: str,
                 }
             })
 
-            if detected_qnum is None:
-                qnum += 1
+            last_assigned_qno = qno
 
     return out
 
