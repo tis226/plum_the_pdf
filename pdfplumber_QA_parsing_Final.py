@@ -84,11 +84,28 @@ SUBJECT_CANDIDATES = list(dict.fromkeys(SUBJECT_CANDIDATES))
 CANDIDATE_SET = {_norm_header_token(x): x for x in SUBJECT_CANDIDATES}
 CANDIDATE_COLLAPSED = {_norm_collapse(x): x for x in SUBJECT_CANDIDATES}
 
-CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
-OPT_SPLIT_RE = re.compile(rf"(?=([{CIRCLED}]))")
-CIRCLED_STRIP_RE = re.compile(rf"^[{CIRCLED}]\s*")
+OPTION_RANGES = [
+    (0x2460, 0x2473),  # ①-⑳
+    (0x2474, 0x2487),  # ⑴-⒇
+    (0x2488, 0x249B),  # ⒈-⒛
+    (0x24F5, 0x24FE),  # ⓵-⓾
+]
+OPTION_EXTRA = {0x24EA, 0x24FF, 0x24DB}  # ⓪, ⓿, ⓛ
+OPTION_SET = {
+    chr(cp)
+    for start, end in OPTION_RANGES
+    for cp in range(start, end + 1)
+}
+OPTION_SET.update(chr(cp) for cp in OPTION_EXTRA)
+OPTION_CLASS = "".join(sorted(OPTION_SET))
+QUESTION_CIRCLED_RANGE = f"{OPTION_CLASS}{chr(0x3250)}-{chr(0x32FF)}"
 
-QUESTION_START_LINE_RE = re.compile(rf"^\s*(?:[{CIRCLED}]|[0-9]{{1,3}}[.)]|제\s*[0-9]{{1,3}}\s*문)")
+OPT_SPLIT_RE = re.compile(rf"(?=([{OPTION_CLASS}]))")
+CIRCLED_STRIP_RE = re.compile(rf"^[{OPTION_CLASS}]\s*")
+
+QUESTION_START_LINE_RE = re.compile(
+    rf"^\s*(?:[{QUESTION_CIRCLED_RANGE}]|[0-9]{{1,3}}[.)]|제\s*[0-9]{{1,3}}\s*문)"
+)
 QUESTION_NUM_RE = re.compile(r"^\s*(?:\(\s*(\d{1,3})\s*\)|(\d{1,3})\s*번|(\d{1,3}))\s*[.)]?\s*")
 
 DISPUTE_RE = re.compile(
@@ -445,10 +462,11 @@ def extract_qa_from_chunk_text(text: str):
     if not text: return None, None, False, None, None
     text = _strip_header_garbage(text)
 
-    first = text.find("①")
-    if first == -1:
+    first_match = re.search(rf"[{OPTION_CLASS}]", text)
+    if not first_match:
         return None, None, False, None, None
 
+    first = first_match.start()
     stem, opts_blob = text[:first], text[first:]
 
     dispute, dispute_site, stem = parse_dispute(stem, keep_text=True)
@@ -462,14 +480,14 @@ def extract_qa_from_chunk_text(text: str):
     i = 0
     while i < len(parts):
         sym = parts[i].strip()
-        if sym and sym[0] in CIRCLED:
+        if sym and sym[0] in OPTION_SET:
             raw_txt = parts[i+1] if (i+1) < len(parts) else ""
             clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
             options.append({"index": sym[0], "text": clean_txt})
             i += 2
         else:
             i += 1
-    options = [o for o in options if o["index"] in CIRCLED]
+    options = [o for o in options if o["index"] in OPTION_SET]
     if not options:
         return None, None, dispute, dispute_site, detected_qnum
 
