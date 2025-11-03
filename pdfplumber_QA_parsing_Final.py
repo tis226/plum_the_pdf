@@ -104,7 +104,8 @@ OPT_SPLIT_RE = re.compile(rf"(?=([{OPTION_CLASS}]))")
 CIRCLED_STRIP_RE = re.compile(rf"^[{OPTION_CLASS}]\s*")
 
 QUESTION_START_LINE_RE = re.compile(
-    rf"^\s*(?:[{QUESTION_CIRCLED_RANGE}]|[0-9]{{1,3}}[.)]|제\s*[0-9]{{1,3}}\s*문)"
+    rf"^\s*(?:[{QUESTION_CIRCLED_RANGE}]|[0-9]{{1,3}}[.)]|제\s*[0-9]{{1,3}}\s*문)",
+    re.MULTILINE,
 )
 QUESTION_NUM_RE = re.compile(r"^\s*(?:\(\s*(\d{1,3})\s*\)|(\d{1,3})\s*번|(\d{1,3}))\s*[.)]?\s*")
 
@@ -362,16 +363,43 @@ def extract_lines_in_bbox(page, bbox, y_tol=3.0,
         out.append({"x0": lx0, "x1": lx1, "top": top, "bottom": bot, "y": 0.5*(top+bot), "text": txt})
     return out
 
-def detect_question_starts(lines, margin_abs: Optional[float], col_left: float, tol=1.0):
+def _extract_qnum_from_text(text: str) -> Optional[int]:
+    m = QUESTION_NUM_RE.match(text.strip())
+    if not m:
+        return None
+    raw = next((g for g in m.groups() if g), None)
+    if raw is None:
+        return None
+    try:
+        num = int(raw)
+    except Exception:
+        return None
+    if num >= 1000:
+        return None
+    return num
+
+
+def detect_question_starts(lines, margin_abs: Optional[float], col_left: float,
+                           tol=1.0, last_qnum: Optional[int] = None):
     starts = []
     target_rel = None if margin_abs is None else (margin_abs - col_left)
+    current_last = last_qnum
     for i, ln in enumerate(lines):
+        text = (ln.get("text") or "").strip()
+        if not text:
+            continue
         rel = ln["x0"] - col_left
         left_ok = True if target_rel is None else abs(rel - target_rel) <= tol
-        text_ok = bool(QUESTION_START_LINE_RE.search(ln["text"]))
-        if left_ok and text_ok:
+        text_ok = bool(QUESTION_START_LINE_RE.match(text))
+        if not text_ok:
+            continue
+        qnum = _extract_qnum_from_text(text)
+        seq_ok = qnum is not None and (current_last is None or qnum == current_last + 1)
+        if left_ok or seq_ok:
             starts.append(i)
-    return starts
+            if qnum is not None:
+                current_last = qnum
+    return starts, current_last
 
 def build_flow_segments(pdf, top_frac, bottom_frac, gutter_frac, y_tol,
                         clip_mode: str,
@@ -406,8 +434,12 @@ def flow_chunk_all_pages(pdf, L_rel_offset, R_rel_offset, y_tol, tol, top_frac, 
         seg_meta.append((pi, col, bbox, lines, margin_abs, col_left))
 
     seg_starts = []
+    last_detected_qnum = None
     for (pi, col, bbox, lines, m_abs, col_left) in seg_meta:
-        seg_starts.append(detect_question_starts(lines, m_abs, col_left, tol=tol))
+        starts, last_detected_qnum = detect_question_starts(
+            lines, m_abs, col_left, tol=tol, last_qnum=last_detected_qnum
+        )
+        seg_starts.append(starts)
 
     chunks, current = [], None
     for seg_idx, (pi, col, bbox, lines, m_abs, col_left) in enumerate(seg_meta):
