@@ -100,6 +100,15 @@ OPTION_SET.update(chr(cp) for cp in OPTION_EXTRA)
 OPTION_CLASS = "".join(sorted(OPTION_SET))
 QUESTION_CIRCLED_RANGE = f"{OPTION_CLASS}{chr(0x3250)}-{chr(0x32FF)}"
 
+OPTION_HEADER_TOKENS = {
+    "보기",
+    "보기문",
+    "보기자료",
+    "보기지문",
+    "다음보기",
+    "보기문제",
+}
+
 OPT_SPLIT_RE = re.compile(rf"(?=([{OPTION_CLASS}]))")
 CIRCLED_STRIP_RE = re.compile(rf"^[{OPTION_CLASS}]\s*")
 
@@ -478,13 +487,28 @@ def flow_chunk_all_pages(pdf, L_rel_offset, R_rel_offset, y_tol, tol, top_frac, 
                     lines.append(stripped)
         if not lines:
             return False
-        if len(lines) > 8:
+        if len(lines) > 10:
             return False
+
+        header_allowance = 0
+        option_lines = 0
+
         for line in lines:
             first = next((ch for ch in line if not ch.isspace()), None)
-            if not first or first not in OPTION_SET:
-                return False
-        return True
+            if first and first in OPTION_SET:
+                option_lines += 1
+                continue
+
+            compact = re.sub(r"[\s<>()\[\]{}:：·•]", "", line)
+            if compact in OPTION_HEADER_TOKENS:
+                header_allowance += 1
+                if header_allowance > 1:
+                    return False
+                continue
+
+            return False
+
+        return option_lines > 0
 
     merged_chunks = []
     for chunk in chunks:
