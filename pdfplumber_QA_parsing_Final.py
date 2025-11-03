@@ -458,6 +458,59 @@ def extract_leading_qnum_and_clean(stem: str):
     except Exception: qnum = None
     return qnum, stem[m.end():].lstrip()
 
+def _trim_to_first_question(text: str) -> Tuple[str, Optional[int]]:
+    if not text:
+        return text, None
+    m = QUESTION_START_LINE_RE.search(text)
+    if not m:
+        return text, None
+    trimmed = text[m.start():]
+    digits = None
+    dm = QUESTION_NUM_RE.match(trimmed)
+    if dm:
+        raw = next((g for g in dm.groups() if g), None)
+        try:
+            digits = int(raw) if raw is not None else None
+        except Exception:
+            digits = None
+    return trimmed, digits
+
+def sanitize_chunk_text(text: str, expected_next_qnum: Optional[int]) -> str:
+    if not text:
+        return text
+
+    trimmed, current_qnum = _trim_to_first_question(text)
+    text = trimmed
+
+    if current_qnum is not None:
+        target_next = current_qnum + 1
+    else:
+        target_next = expected_next_qnum
+
+    if target_next is None:
+        return text
+
+    for match in QUESTION_START_LINE_RE.finditer(text):
+        if match.start() == 0:
+            continue
+        candidate_slice = text[match.start():]
+        dm = QUESTION_NUM_RE.match(candidate_slice)
+        if not dm:
+            continue
+        raw = next((g for g in dm.groups() if g), None)
+        if raw is None:
+            continue
+        try:
+            num = int(raw)
+        except Exception:
+            continue
+        if num >= 1000:  # likely a date/year, skip trimming
+            continue
+        if num == target_next:
+            return text[:match.start()].rstrip()
+
+    return text
+
 def extract_qa_from_chunk_text(text: str):
     if not text: return None, None, False, None, None
     text = _strip_header_garbage(text)
@@ -539,7 +592,7 @@ def pdf_to_qa_flow_chunks(pdf_path: str,
                           chunk_preview_dpi: int = 220,
                           chunk_preview_pad: float = 2.0):
     out = []
-    qnum = start_num
+    last_assigned_qno = start_num - 1
     global_idx = 0
     preview_dir = os.path.abspath(os.path.expanduser(chunk_preview_dir)) if chunk_preview_dir else None
 
@@ -571,14 +624,21 @@ def pdf_to_qa_flow_chunks(pdf_path: str,
             if p1 in skip_pages:
                 continue
 
+            expected_next = last_assigned_qno + 1 if last_assigned_qno is not None else None
             text = "\n".join(p["text"] for p in pieces if p.get("text"))
+            text = sanitize_chunk_text(text, expected_next)
             stem, options, dispute, dispute_site, detected_qnum = extract_qa_from_chunk_text(text)
             if stem is None or not options:
                 continue
 
             subj = inh_subject.get(p1) or subject_default
             targ = inh_target.get(p1)  or target_default
-            qno  = detected_qnum if detected_qnum is not None else qnum
+            if detected_qnum is not None:
+                qno = detected_qnum
+            elif expected_next is not None:
+                qno = expected_next
+            else:
+                qno = start_num
             global_idx += 1
 
             preview_path = None
@@ -604,8 +664,7 @@ def pdf_to_qa_flow_chunks(pdf_path: str,
                 }
             })
 
-            if detected_qnum is None:
-                qnum += 1
+            last_assigned_qno = qno
 
     return out
 
