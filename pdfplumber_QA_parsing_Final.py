@@ -478,37 +478,44 @@ def flow_chunk_all_pages(pdf, L_rel_offset, R_rel_offset, y_tol, tol, top_frac, 
         chunks.append(current)
 
     def _is_option_only_chunk(chunk):
-        lines = []
+        raw_lines = []
         for piece in chunk.get("pieces", []):
             text = piece.get("text") or ""
             for raw_line in text.splitlines():
-                stripped = raw_line.strip()
-                if stripped:
-                    lines.append(stripped)
-        if not lines:
-            return False
-        if len(lines) > 10:
+                if raw_line.strip():
+                    raw_lines.append(raw_line)
+
+        if not raw_lines:
             return False
 
         header_allowance = 0
         option_lines = 0
+        option_seen = False
 
-        for line in lines:
-            first = next((ch for ch in line if not ch.isspace()), None)
-            if first and first in OPTION_SET:
-                option_lines += 1
+        for line in raw_lines:
+            stripped = line.lstrip()
+            if not stripped:
                 continue
 
-            compact = re.sub(r"[\s<>()\[\]{}:：·•]", "", line)
+            first_char = stripped[0]
+            if first_char in OPTION_SET:
+                option_lines += 1
+                option_seen = True
+                continue
+
+            compact = re.sub(r"[\s<>()\[\]{}:：·•]", "", stripped)
             if compact in OPTION_HEADER_TOKENS:
                 header_allowance += 1
                 if header_allowance > 1:
                     return False
                 continue
 
-            return False
+            if QUESTION_START_LINE_RE.match(stripped):
+                # This looks like the start of another question, so don't treat
+                # it as an option-only block.
+                return False
 
-        return option_lines > 0
+        return option_seen and option_lines > 0
 
     merged_chunks = []
     for chunk in chunks:
