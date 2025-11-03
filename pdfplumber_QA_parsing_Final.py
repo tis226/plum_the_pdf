@@ -468,6 +468,33 @@ def flow_chunk_all_pages(pdf, L_rel_offset, R_rel_offset, y_tol, tol, top_frac, 
     if current is not None:
         chunks.append(current)
 
+    def _is_option_only_chunk(chunk):
+        lines = []
+        for piece in chunk.get("pieces", []):
+            text = piece.get("text") or ""
+            for raw_line in text.splitlines():
+                stripped = raw_line.strip()
+                if stripped:
+                    lines.append(stripped)
+        if not lines:
+            return False
+        if len(lines) > 8:
+            return False
+        for line in lines:
+            first = next((ch for ch in line if not ch.isspace()), None)
+            if not first or first not in OPTION_SET:
+                return False
+        return True
+
+    merged_chunks = []
+    for chunk in chunks:
+        if merged_chunks and _is_option_only_chunk(chunk):
+            merged_chunks[-1].setdefault("pieces", []).extend(chunk.get("pieces", []))
+            continue
+        merged_chunks.append(chunk)
+
+    chunks = merged_chunks
+
     per_page_boxes = {i: [] for i in range(len(pdf.pages))}
     for ch_id, ch in enumerate(chunks, start=1):
         for p in ch.get("pieces", []):
